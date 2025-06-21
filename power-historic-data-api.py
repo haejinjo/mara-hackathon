@@ -1,3 +1,9 @@
+# Time Period: 2025-06-21 14:00:00 to 14:29:59
+# Total Data Points: 1,800 (one per second)
+# Location: ERCOT West Zone, Texas
+# Facility: 1,700 ASICs (500x S19 XP, 800x S19j Pro, 400x M50S)
+# Includes real-time electricity prices and demand response events
+
 {
   "metadata": {
     "facility": "Mara Holdings Mining Center",
