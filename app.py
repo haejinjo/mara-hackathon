@@ -6,7 +6,8 @@ from apscheduler.triggers.cron import CronTrigger
 import logging
 
 # Import your scheduled task functions
-from util.scheduled_tasks import my_scheduled_task, another_daily_task
+from util.scheduled_tasks import my_scheduled_task
+from db.db import create_tables
 
 # Configure logging (good practice)
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +22,9 @@ async def lifespan(app: FastAPI):
     Context manager for application startup and shutdown events.
     Used to start and stop the APScheduler.
     """
+    logger.info("Creating database tables...")
+    create_tables()
+    logger.info("Database tables created.")
     logger.info("Starting scheduler...")
 
     # Add your jobs here, referencing the imported functions
