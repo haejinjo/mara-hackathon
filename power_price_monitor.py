@@ -8,6 +8,19 @@ from datetime import datetime, timedelta
 import json
 from collections import deque
 
+# Import the HashPricePredictor
+try:
+    from hash_library import HashPricePredictor
+    PREDICTOR_AVAILABLE = True
+    # Initialize the predictor
+    if 'hash_predictor' not in st.session_state:
+        st.session_state.hash_predictor = HashPricePredictor("best_gru.pt", device="cpu")
+        st.session_state.hash_price_window = deque(maxlen=30)  # Keep last 30 hash prices
+except Exception as e:
+    PREDICTOR_AVAILABLE = False
+    st.error(f"❌ HashPricePredictor not available: {e}")
+    st.info("The app will continue without AI predictions.")
+
 # Page configuration
 st.set_page_config(
     page_title="Hashrate Prediction Power Autoscaler",
@@ -63,11 +76,16 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state for data management
+# Initialize basic session state for data management
 if 'price_buffer' not in st.session_state:
     st.session_state.price_buffer = deque(maxlen=600)  # 10 minutes of data buffer (sliding window shows 5 minutes)
     st.session_state.current_index = 0
     st.session_state.is_monitoring = True
+    st.session_state.initialized = False
+
+# Ensure hash_price_window is initialized if predictor is available
+if PREDICTOR_AVAILABLE and 'hash_price_window' not in st.session_state:
+    st.session_state.hash_price_window = deque(maxlen=30)
 
 def fetch_electricity_price():
     """Fetch real-time electricity spot price and hashrate data"""
@@ -88,6 +106,12 @@ def fetch_electricity_price():
                         'power_mw': item.get('power_mw', 5.8156),  # MW
                         'hashrate_ths': item.get('hashrate_ths', 183200),  # TH/s
                         'hashrate_phs': item.get('hashrate_ths', 183200) / 1000,  # Convert to PH/s (183.2 PH/s)
+                        # Scale hash price to match training data: original was ~6.3e-07, target ~$55/day = 6.365e-04/sec
+                        'hash_price': item.get('hash_price', 6.3e-07) * 1010.0,  # Scale factor: 6.365e-04 / 6.3e-07 ≈ 1010
+                        # Calculate realistic mining revenue: hashrate * hash_price
+                        # ~190,000 TH/s * 6.365e-04 $/TH/s = ~121 $/s
+                        'mining_revenue': item.get('hashrate_ths', 183200) * item.get('hash_price', 6.3e-07) * 1010.0,
+                        'temperature': item.get('temperature', 20.0),  # Celsius
                     }
                     for i, item in enumerate(data.get('data', []))
                 ]
@@ -99,6 +123,15 @@ def fetch_electricity_price():
             price_point = data_points[data_index].copy()
             price_point['timestamp'] = datetime.now()
             st.session_state.current_index += 1
+            
+            # Store hash price for prediction if predictor is available
+            if PREDICTOR_AVAILABLE and 'hash_price_window' in st.session_state:
+                # Convert hash_price to USD (from USD per TH/s per second to USD per TH/s per day)
+                hash_price_usd = price_point['hash_price'] * 86400  # Convert per second to per day
+                st.session_state.hash_price_window.append(hash_price_usd)
+                
+
+            
             return price_point
         else:
             # Fallback to simulated data
@@ -128,20 +161,118 @@ def generate_simulated_price():
     power_multiplier = hashrate_multiplier * (1 + random_variation * 0.3)
     current_power = base_power * power_multiplier
     
+    # Simulate hash price in the range similar to training data (around $50-60/TH/day)
+    # Convert to per-second for internal consistency: $55/day ÷ 86400 seconds
+    base_hash_price_per_day = 55.0  # USD per TH/s per day (similar to training data)
+    base_hash_price = base_hash_price_per_day / 86400  # Convert to per second
+    # Add variation similar to training data (±10-15%)
+    hash_price_variation = base_hash_price * (1 + random_variation * 0.3)
+    
     st.session_state.current_index += 1
     
-    return {
+    data_point = {
         'timestamp': datetime.now(),
         'price_per_kwh': current_price,
         'price_per_mwh': current_price * 1000,
         'power_mw': current_power,
         'hashrate_ths': current_hashrate,
-        'hashrate_phs': current_hashrate / 1000
+        'hashrate_phs': current_hashrate / 1000,
+        'hash_price': hash_price_variation,  # Simulated hash price with variation
+        'mining_revenue': current_hashrate * hash_price_variation,  # Calculated mining revenue
+        'temperature': 20.0 + random_variation * 5,  # Simulated temperature with variation
     }
+    
+    # Store hash price for prediction if predictor is available
+    if PREDICTOR_AVAILABLE and 'hash_price_window' in st.session_state:
+        # Convert hash_price to USD (from USD per TH/s per second to USD per TH/s per day)
+        hash_price_usd = data_point['hash_price'] * 86400  # Convert per second to per day
+        st.session_state.hash_price_window.append(hash_price_usd)
+    
+    return data_point
+
+def predict_hash_rate():
+    """Predict hash rate using the last 30 hash price data points"""
+    if not PREDICTOR_AVAILABLE:
+        return None
+    
+    # Check if hash_price_window exists and has enough data
+    if 'hash_price_window' not in st.session_state:
+        return None
+        
+    window_size = len(st.session_state.hash_price_window)
+    if window_size < 30:
+        return None
+    
+    try:
+        # Get the last 30 hash prices
+        price_window = list(st.session_state.hash_price_window)
+        
+
+        
+        # Get the latest temperature and other parameters
+        latest_temp = 20.0  # Default temperature
+        if hasattr(st.session_state, 'price_data') and st.session_state.price_data:
+            latest_index = (st.session_state.current_index - 1) % len(st.session_state.price_data)
+            latest_temp = st.session_state.price_data[latest_index].get('temperature', 20.0)
+        
+        # Predict hash price for next day
+        predicted_hash_price = st.session_state.hash_predictor.predict(
+            price_window,
+            fng_value=57.0,  # Neutral sentiment
+            sent_class="Greed",  # Default sentiment
+            temp_mean=latest_temp,
+            days_ahead=1
+        )
+        
+        # Convert predicted hash price back to per-second basis
+        predicted_hash_price_per_sec = predicted_hash_price / 86400
+        
+        # Estimate predicted hash rate using current mining revenue
+        # Relationship: hashrate = mining_revenue / hash_price
+        current_mining_revenue = 120.0  # Default mining revenue per second (realistic scale)
+        if hasattr(st.session_state, 'price_data') and st.session_state.price_data:
+            latest_index = (st.session_state.current_index - 1) % len(st.session_state.price_data)
+            current_mining_revenue = st.session_state.price_data[latest_index].get('mining_revenue', 120.0)
+        
+        predicted_hashrate_ths = current_mining_revenue / predicted_hash_price_per_sec
+        
+
+        
+        return predicted_hashrate_ths
+        
+    except Exception as e:
+        # Don't show error during initialization to avoid clutter
+        if st.session_state.current_index > 30:
+            st.error(f"❌ Prediction Error: {str(e)}")
+        return None
+
+# Initialize with 30 data points for immediate AI predictions (after functions are defined)
+if not st.session_state.initialized:
+    with st.spinner("🔄 Initializing with 30 data points for AI predictions..."):
+        for i in range(30):
+            # Generate initial data points with time offset (spread over last 30 seconds)
+            initial_data = fetch_electricity_price()
+            initial_data['timestamp'] = datetime.now() - timedelta(seconds=30-i)
+            
+            # For the first 29 points, don't try to predict yet (need 30 points)
+            if i < 29:
+                initial_data['predicted_hashrate_ths'] = None
+            else:
+                # On the 30th point, try to make a prediction
+                predicted_hashrate = predict_hash_rate()
+                initial_data['predicted_hashrate_ths'] = predicted_hashrate
+                
+            st.session_state.price_buffer.append(initial_data)
+    
+    st.session_state.initialized = True
+    if PREDICTOR_AVAILABLE and 'hash_price_window' in st.session_state and len(st.session_state.hash_price_window) >= 30:
+        st.success("✅ Initialization complete! AI predictions ready.")
+    else:
+        st.warning("⚠️ Initialization complete, but AI predictions may not be available.")
 
 # Header
-st.markdown('<h1 class="main-header">⚡ Mining Facility Power & Performance Monitor</h1>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">Real-time monitoring of power consumption and mining hashrate performance</p>', unsafe_allow_html=True)
+st.markdown('<h1 class="main-header">🧠 AI-Powered Mining Facility Monitor</h1>', unsafe_allow_html=True)
+st.markdown('<p class="sub-header">Real-time monitoring with AI-driven hashrate predictions using the last 30 hash price data points</p>', unsafe_allow_html=True)
 
 # Control panel
 col1, col2, col3 = st.columns([1, 1, 8])
@@ -168,6 +299,14 @@ while True:
         # Fetch 10 new data points at once
         for _ in range(10):
             price_data = fetch_electricity_price()
+            
+            # Add predicted hash rate if available
+            predicted_hashrate = predict_hash_rate()
+            if predicted_hashrate is not None:
+                price_data['predicted_hashrate_ths'] = predicted_hashrate
+            else:
+                price_data['predicted_hashrate_ths'] = None
+                
             st.session_state.price_buffer.append(price_data)
         
         # Convert buffer to DataFrame
@@ -178,45 +317,38 @@ while True:
         
         # Update current price display
         with st.session_state.containers['current_price'].container():
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3 = st.columns(3)
             
             with col1:
-                # Calculate price change (comparing latest to 10 points ago)
-                price_change = 0
-                if len(df) > 10:
-                    price_change = df['price_per_mwh'].iloc[-1] - df['price_per_mwh'].iloc[-11]
-                
-                st.metric(
-                    label="Energy Price",
-                    value=f"${latest_data['price_per_mwh']:.2f}/MWh",
-                    delta=f"{price_change:.2f} $/MWh"
-                )
-            
-            with col2:
-                # Calculate power change (comparing latest to 10 points ago)
-                power_change = 0
-                if len(df) > 10:
-                    power_change = df['power_mw'].iloc[-1] - df['power_mw'].iloc[-11]
-                
-                st.metric(
-                    label="Power Consumption",
-                    value=f"{latest_data['power_mw']:.3f} MW",
-                    delta=f"{power_change:.3f} MW"
-                )
-            
-            with col3:
                 # Calculate hashrate change (comparing latest to 10 points ago)
                 hashrate_change = 0
                 if len(df) > 10:
                     hashrate_change = df['hashrate_ths'].iloc[-1] - df['hashrate_ths'].iloc[-11]
                 
                 st.metric(
-                    label="Hash Rate",
+                    label="Hash Rate (Actual)",
                     value=f"{latest_data['hashrate_ths']:,.0f} TH/s",
                     delta=f"{hashrate_change:,.0f} TH/s"
                 )
             
-            with col4:
+            with col2:
+                # Predicted hash rate
+                predicted_hashrate = latest_data.get('predicted_hashrate_ths')
+                if predicted_hashrate is not None and PREDICTOR_AVAILABLE:
+                    prediction_delta = predicted_hashrate - latest_data['hashrate_ths']
+                    st.metric(
+                        label="Hash Rate (Predicted)",
+                        value=f"{predicted_hashrate:,.0f} TH/s",
+                        delta=f"{prediction_delta:,.0f} TH/s vs actual"
+                    )
+                else:
+                    st.metric(
+                        label="Hash Rate (Predicted)",
+                        value="Calculating...",
+                        delta="Need 30 data points"
+                    )
+            
+            with col3:
                 # Price status indicator
                 avg_price = df['price_per_mwh'].mean() if len(df) > 10 else price_data['price_per_mwh']
                 status = "🟢 Below Average" if price_data['price_per_mwh'] < avg_price else "🔴 Above Average"
@@ -228,8 +360,9 @@ while True:
         
         # Update power and hashrate chart
         with st.session_state.containers['price_chart'].container():
-            st.subheader("Power Consumption & Hash Rate Monitoring")
-            st.caption("📊 Sliding 5-minute window • Updates every 10 seconds with 10 data points")
+            st.subheader("Power Consumption & Hash Rate Monitoring with AI Predictions")
+            predictor_status = "🧠 AI Predictions Active" if PREDICTOR_AVAILABLE else "⚠️ AI Predictor Unavailable"
+            st.caption(f"📊 Sliding 5-minute window • Updates every 10 seconds with 10 data points • {predictor_status}")
             
             # Create subplot with secondary y-axis
             fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -252,12 +385,25 @@ while True:
                 x=df['timestamp'],
                 y=df['hashrate_ths'],
                 mode='lines',
-                name='Hash Rate',
+                name='Hash Rate (Actual)',
                 line=dict(color='#4ecdc4', width=2),
                 hovertemplate='<b>%{y:,.0f} TH/s</b><br>%{x|%H:%M:%S}<extra></extra>',
                 yaxis='y2',
                 connectgaps=False
             ), secondary_y=True)
+            
+            # Add predicted hashrate line if available
+            if 'predicted_hashrate_ths' in df.columns and df['predicted_hashrate_ths'].notna().any():
+                fig.add_trace(go.Scatter(
+                    x=df['timestamp'],
+                    y=df['predicted_hashrate_ths'],
+                    mode='lines',
+                    name='Hash Rate (Predicted)',
+                    line=dict(color='#e74c3c', width=2, dash='dash'),
+                    hovertemplate='<b>%{y:,.0f} TH/s (Predicted)</b><br>%{x|%H:%M:%S}<extra></extra>',
+                    yaxis='y2',
+                    connectgaps=False
+                ), secondary_y=True)
             
             # Add average power line
             if len(df) > 1:
@@ -366,23 +512,48 @@ while True:
                     """)
                 
                 with col4:
-                    # Recent trend
-                    recent_trend = "Stable"
-                    if len(df) >= 10:
-                        recent_prices = df['price_per_mwh'].tail(10)
-                        if recent_prices.iloc[-1] > recent_prices.iloc[0] * 1.05:
-                            recent_trend = "📈 Rising"
-                        elif recent_prices.iloc[-1] < recent_prices.iloc[0] * 0.95:
-                            recent_trend = "📉 Falling"
+                    # AI Prediction Performance
+                    if PREDICTOR_AVAILABLE and 'predicted_hashrate_ths' in df.columns:
+                        prediction_count = df['predicted_hashrate_ths'].notna().sum()
+                        if prediction_count > 0:
+                            # Calculate prediction accuracy stats
+                            actual_values = df['hashrate_ths'].dropna()
+                            predicted_values = df['predicted_hashrate_ths'].dropna()
+                            
+                            if len(actual_values) > 0 and len(predicted_values) > 0:
+                                latest_actual = actual_values.iloc[-1]
+                                latest_predicted = predicted_values.iloc[-1]
+                                accuracy = abs(latest_predicted - latest_actual) / latest_actual * 100
+                                
+                                st.info(f"""
+                                **AI Prediction Model**  
+                                Status: 🧠 Active  
+                                Predictions: {prediction_count}  
+                                Latest Error: {accuracy:.1f}%  
+                                Data Points: {len(st.session_state.hash_price_window)}/30
+                                """)
+                            else:
+                                st.info(f"""
+                                **AI Prediction Model**  
+                                Status: 🔄 Warming Up  
+                                Predictions: {prediction_count}  
+                                Data Points: {len(st.session_state.hash_price_window) if 'hash_price_window' in st.session_state else 0}/30
+                                """)
                         else:
-                            recent_trend = "➡️ Stable"
-                    
-                    st.info(f"""
-                    **Market Trend**  
-                    Status: {recent_trend}  
-                    Latest: ${df['price_per_mwh'].iloc[-1]:.2f}/MWh  
-                    Change: {((df['price_per_mwh'].iloc[-1]/df['price_per_mwh'].iloc[0] - 1) * 100):.1f}%
-                    """)
+                            st.info(f"""
+                            **AI Prediction Model**  
+                            Status: ⏳ Collecting Data  
+                            Hash Prices: {len(st.session_state.hash_price_window) if 'hash_price_window' in st.session_state else 0}/30  
+                            Ready: {'✅' if len(st.session_state.hash_price_window) >= 30 else '❌'}
+                            """)
+                    else:
+                        st.info(f"""
+                        **AI Prediction Model**  
+                        Status: ⚠️ Unavailable  
+                        Reason: Missing Dependencies  
+                        Required: HashPricePredictor  
+                        Install: pip install torch
+                        """)
     
     # Update every 10 seconds (with 10 data points each time)
     time.sleep(10)
