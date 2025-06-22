@@ -2,6 +2,10 @@
 
 A Reinforcement Learning-driven application that displays predictive selections based on historical hashrate data for optimized mining operations.
 
+## Demo
+
+![Mining Alpha Dashboard](miningalpha.gif)
+
 ## Features
 
 - **RL-powered predictive analytics** trained on historical hashrate data
