@@ -348,7 +348,7 @@ while True:
         
         # Update current price display
         with st.session_state.containers['current_price'].container():
-            col1, col2, col3 = st.columns(3)
+            col1, col2 = st.columns(2)
             
             with col1:
                 # Calculate hashrate change (comparing latest to 10 points ago)
@@ -395,16 +395,6 @@ while True:
                         value="Calculating...",
                         delta="Need 30 data points"
                     )
-            
-            with col3:
-                # Price status indicator
-                avg_price = df['price_per_mwh'].mean() if len(df) > 10 else price_data['price_per_mwh']
-                status = "🟢 Below Average" if price_data['price_per_mwh'] < avg_price else "🔴 Above Average"
-                st.metric(
-                    label="Price Status",
-                    value=status,
-                    delta=f"vs. avg ${avg_price:.2f}/MWh"
-                )
         
         # Update power and hashrate chart
         with st.session_state.containers['price_chart'].container():
